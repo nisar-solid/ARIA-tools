@@ -20,7 +20,7 @@ import logging
 import datetime
 import tarfile
 import subprocess
-import tqdm
+import threading
 
 import dask
 import rioxarray
@@ -675,7 +675,8 @@ def merged_productbbox(
             is_nisar_file)
 
 
-def create_raster_from_gunw(fname, data_lis, proj, driver, hgt_field=None):
+def create_raster_from_gunw(fname, data_lis, proj, driver, hgt_field=None,
+    sign_multiplier=1):
     """Wrapper to create raster and apply projection using Rioxarray (Safe)"""
 
     # 1) Build a lightweight reference warp (VRT)
@@ -719,6 +720,10 @@ def create_raster_from_gunw(fname, data_lis, proj, driver, hgt_field=None):
             del da.attrs["_FillValue"]
         # -----------------------------------------
         
+        # Flip the sign for NISAR convention
+        if sign_multiplier == -1:
+            da = da * -1
+            
         # Enforce threading during the write
         with rasterio.Env(GDAL_NUM_THREADS='ALL_CPUS'): 
             da.rio.to_raster(fname, driver=driver, crs=proj)
@@ -751,7 +756,7 @@ def create_raster_from_gunw(fname, data_lis, proj, driver, hgt_field=None):
 
 def prep_metadatalayers(
         outname, metadata_arr, dem, layer, layers, is_nisar_file=False,
-        proj='4326', driver='ENVI', model_name=None):
+        proj='4326', driver='ENVI', model_name=None, sign_multiplier=1):
     """Wrapper to prep metadata layer for extraction"""
     if dem is None:
         raise Exception('No DEM input specified. '
@@ -831,7 +836,8 @@ def prep_metadatalayers(
             for j in glob.glob(i[0] + '*'):
                 if os.path.isfile(j):
                     os.remove(j)
-            create_raster_from_gunw(i[0], i[1], proj, driver, hgt_field)
+            create_raster_from_gunw(i[0], i[1], proj, driver, hgt_field,
+                sign_multiplier)
 
         if not is_nisar_file:
             # compute differential
@@ -942,7 +948,7 @@ def prep_metadatalayers(
                                 pass
                 else:
                     create_raster_from_gunw(outname, metadata_arr,
-                        proj, driver, hgt_field)
+                        proj, driver, hgt_field, sign_multiplier)
             else:
                 ds_vrt = osgeo.gdal.BuildVRT(outname + '.vrt', metadata_arr)
                 
@@ -959,7 +965,7 @@ def prep_metadatalayers(
 
 
 def generate_diff(ref_outname, sec_outname, outname, key, OG_key, tropo_total,
-                  hgt_field, proj, driver):
+                  hgt_field, proj, driver, sign_multiplier=1):
     """ Compute differential from reference and secondary scenes (Multi-dim safe) """
 
     # if specified workdir doesn't exist, create it
@@ -984,6 +990,9 @@ def generate_diff(ref_outname, sec_outname, outname, key, OG_key, tropo_total,
                 arr_total = arr_sec + arr_ref
             else:
                 arr_total = arr_sec - arr_ref
+
+            if sign_multiplier == -1:
+                arr_total = arr_total * -1
 
             # 3. Create Output DataArray
             # We copy da_sec to preserve coordinates/dims/attrs
@@ -1047,8 +1056,9 @@ def extract_bperp_dict(products, num_threads):
         # 1. Open explicitly
         ds = osgeo.gdal.Open(frame, osgeo.gdal.GA_ReadOnly)
         
-        # 2. Read data
-        res = ds.ReadAsArray().mean()
+        # 2. Read data and take mean, but ignore NaN values
+        arr = ds.ReadAsArray()
+        res = np.nanmean(arr)
         
         # 3. CRITICAL: Close the file explicitly
         ds = None 
@@ -1150,8 +1160,16 @@ def handle_epoch_layers(
         if not os.path.exists(i):
             os.mkdir(i)
 
+    # Flip sign for external corrections if NISAR
+    sign_multiplier = -1 if (is_nisar_file and key in [
+        'solidEarthTide', 'troposphereWet', 
+        'troposphereHydrostatic', 'troposphereTotal']) else 1
+
     # Iterate through all IFGs
     all_outputs = []
+    prog_bar = ARIAtools.util.misc.ProgressBar(
+        maxValue=len(product_dict[0]), prefix=f'Exporting {key}: '
+    )
     for i in enumerate(product_dict[0]):
         ifg = product_dict[1][i[0]][0]
         outname = os.path.abspath(os.path.join(workdir, ifg))
@@ -1255,6 +1273,9 @@ def handle_epoch_layers(
             sec_outname = os.path.abspath(
                 os.path.join(sec_outname, ifg.split('_')[0]))
 
+        prog_bar.update(i[0] + 1)
+    prog_bar.close()
+
     # delete temporary files if layers not requested
     prod_ver_list = i[1]
     for i in all_workdirs:
@@ -1356,6 +1377,10 @@ def export_product_worker(
         **gdal_warp_kwargs
     )
 
+    # Flip sign for baselines if NISAR
+    sign_multiplier = -1 if (is_nisar_file and layer in [
+        'bPerpendicular', 'bParallel']) else 1
+
     mask = None if maskfile is None else osgeo.gdal.Open(maskfile)
     dem = None if demfile is None else osgeo.gdal.Open(demfile)
     dem_expanded = (
@@ -1421,7 +1446,7 @@ def export_product_worker(
             # make VRT pointing to metadata layers in standard product
             hgt_field, outname = prep_metadatalayers(
                 outname, product, dem_expanded, layer, layers,
-                is_nisar_file, proj)
+                is_nisar_file, proj, sign_multiplier=sign_multiplier)
 
             # Interpolate/intersect with DEM before cropping
             finalize_metadata(
@@ -1436,72 +1461,92 @@ def export_product_worker(
             if is_nisar_file:
 
                 if layer == 'amplitude':
-                    # 1. Build a temp VRT to merge the input files
-                    temp_vrt = outname + '_temp_complex.vrt'
-                    ds_vrt = osgeo.gdal.BuildVRT(temp_vrt, product)
-                    ds_vrt = None
-
-                    # 2. Open VRT and Calculate Amplitude in Memory
-                    # This guarantees we get Magnitude, not Real component
-                    ds_in = osgeo.gdal.Open(temp_vrt)
+                    amp_ds_list = []
+                    # Ensure product is a list
+                    prod_list = product if isinstance(product, list) else [product]
                     
-                    # Create an in-memory (MEM) dataset for the Amplitude
-                    # This avoids writing an intermediate file to disk
                     mem_driver = osgeo.gdal.GetDriverByName('MEM')
-                    ds_amp = mem_driver.Create(
-                        '',
-                        ds_in.RasterXSize,
-                        ds_in.RasterYSize,
-                        1,
-                        osgeo.gdal.GDT_Float32
-                    )
+                    for prod_frame in prod_list:
+                        ds_in = osgeo.gdal.Open(prod_frame)
+                        complex_data = ds_in.GetRasterBand(1).ReadAsArray()
+                        
+                        ds_amp = mem_driver.Create(
+                            '', ds_in.RasterXSize, ds_in.RasterYSize, 1, osgeo.gdal.GDT_Float32
+                        )
+                        ds_amp.SetProjection(ds_in.GetProjection())
+                        ds_amp.SetGeoTransform(ds_in.GetGeoTransform())
+                        
+                        amp_band = ds_amp.GetRasterBand(1)
+                        amp_arr = np.abs(complex_data)
+                        
+                        # 1. Standardize any weird NaNs back to 0 
+                        # so GDAL's C++ engine can safely identify the transparent edge padding
+                        amp_arr[np.isnan(amp_arr)] = 0
+                        
+                        amp_band.WriteArray(amp_arr)
+                        amp_band.SetNoDataValue(0)
+                        
+                        amp_ds_list.append(ds_amp)
+                        ds_in = None
 
-                    # Copy Projection and GeoTransform
-                    ds_amp.SetProjection(ds_in.GetProjection())
-                    ds_amp.SetGeoTransform(ds_in.GetGeoTransform())
-
-                    # Read Complex, Compute Abs, Write Float32
-                    # Note: For ~250MB, this is safe for RAM.
-                    complex_data = ds_in.GetRasterBand(1).ReadAsArray()
-                    ds_amp.GetRasterBand(1).WriteArray(np.abs(complex_data))
-                    
-                    # Close input to free strict lock
-                    ds_in = None
-
-                    # 3. Setup Warp Options
                     amp_kwargs = gdal_warp_kwargs.copy()
-                    
-                    # Handle integer EPSG codes for compliance
+                    amp_kwargs['format'] = outputFormatPhys
                     if ('dstSRS' in amp_kwargs and
                             isinstance(amp_kwargs['dstSRS'], int)):
-                        amp_kwargs['dstSRS'] = (
-                            f"EPSG:{amp_kwargs['dstSRS']}"
-                        )
+                        amp_kwargs['dstSRS'] = f"EPSG:{amp_kwargs['dstSRS']}"
 
-                    # Explicitly force Float32 output
+                    # 2. srcNodata=0 forces the overlapping blank edges to be completely transparent.
+                    # 3. dstNodata=np.nan converts the final stitched background safely back to NaN!
                     amp_warp_opts = osgeo.gdal.WarpOptions(
                         outputType=osgeo.gdal.GDT_Float32,
+                        srcNodata=0,
+                        dstNodata=np.nan,
                         **amp_kwargs
                     )
 
-                    # 4. Warp the In-Memory Amplitude to Disk
-                    # We pass the 'ds_amp' object directly to Warp
+                    # Warp directly from the MEM datasets
                     ds_amp_warp = osgeo.gdal.Warp(
-                        outname, ds_amp, options=amp_warp_opts
+                        outname, amp_ds_list, options=amp_warp_opts
                     )
-
+                    
                     # Cleanup
-                    ds_amp = None
                     ds_amp_warp = None
-                    if os.path.exists(temp_vrt):
-                        os.remove(temp_vrt)
+                    amp_ds_list = None
 
                 else:
                     # Standard NISAR layer options
-                    ds = osgeo.gdal.Warp(
-                        outname, product, options=warp_options
-                    )
-                    ds = None
+                    # 1. If multiple frames are passed, build a VRT mosaic
+                    if isinstance(product, list) and len(product) > 1:
+                        tmp_mosaic = str(outname) + "_uncropped.vrt"
+                        
+                        # Reproject heterogeneous UTM zones safely via VRTs
+                        tmp_vrts = []
+                        for idx, p in enumerate(product):
+                            t_vrt = f"{outname}_{idx}_tmp.vrt"
+                            osgeo.gdal.Warp(
+                                t_vrt, p, format="VRT", dstSRS=proj
+                            )
+                            tmp_vrts.append(t_vrt)
+                            
+                        osgeo.gdal.BuildVRT(tmp_mosaic, tmp_vrts)
+                        warp_inputs = tmp_mosaic
+                    else:
+                        warp_inputs = (
+                            product[0] if isinstance(product, list)
+                            else product
+                        )
+
+                    # 2. Safely warp the single mosaic/file
+                    if outputFormat == 'VRT':
+                        ds = osgeo.gdal.Warp(
+                            outname + '.vrt', warp_inputs, options=warp_options
+                        )
+                        ds = None
+                    else:
+                        ds = osgeo.gdal.Warp(
+                            outname, warp_inputs, options=warp_options
+                        )
+                        ds = None
 
             else:
                 # Legacy handling
@@ -1538,15 +1583,26 @@ def export_product_worker(
                         )
                         ds_trans = None
 
-            # Create VRT (Global for this block)
-            ds_trans = osgeo.gdal.Translate(
-                outname + '.vrt',
-                outname,
-                options=osgeo.gdal.TranslateOptions(
-                    format="VRT"
+            # Create VRT pointing to physical file if a physical file was written
+            if os.path.exists(outname):
+                ds_trans = osgeo.gdal.Translate(
+                    outname + '.vrt', outname, format="VRT"
                 )
-            )
-            ds_trans = None
+                ds_trans = None
+
+            # VRT formats require the source mosaic to remain on disk.
+            # Only delete the uncropped mosaic if data was physically extracted.
+            if outputFormat != 'VRT':
+                tmp_mosaic = str(outname) + "_uncropped.vrt"
+                if os.path.exists(tmp_mosaic):
+                    os.remove(tmp_mosaic)
+                
+                # Clean up intermediate heterogeneous projection VRTs!
+                if isinstance(product, list) and len(product) > 1:
+                    for idx in range(len(product)):
+                        t_vrt = f"{outname}_{idx}_tmp.vrt"
+                        if os.path.exists(t_vrt):
+                            os.remove(t_vrt)
 
         # Extract/crop phs and conn_comp layers
         else:
@@ -1570,6 +1626,7 @@ def export_product_worker(
                 bounds=bounds, clip_json=prods_TOTbbox, output_unw=outFilePhs,
                 output_conn=outFileConnComp,
                 output_format=outputFormatPhys,
+                is_nisar_file=is_nisar_file,
                 range_correction=range_correction, save_fig=False,
                 overwrite=True)
 
@@ -1641,7 +1698,7 @@ def export_product_worker(
 
 def export_products(
         full_product_dict, proj, bbox_file, prods_TOTbbox, layers, arrres,
-        is_nisar_file, rankedResampling=False, demfile=None,
+        iono_filter, is_nisar_file, rankedResampling=False, demfile=None,
         demfile_expanded=None, lat=None, lon=None, maskfile=None, outDir='./',
         outputFormat='VRT', verbose=None, num_threads='2', multilooking=None,
         tropo_total=False, model_names=[], multiproc_method='single',
@@ -1655,6 +1712,8 @@ def export_products(
     and clipped to the track extent denoted by the input prods_TOTbbox.
     Optionally, a user may pass a mask-file.
     """
+
+    start_time = time.time()
     LOGGER.debug('export_products, layers: {}'.format(layers))
 
     if not layers and not tropo_total:
@@ -1664,6 +1723,7 @@ def export_products(
     ref_wid = None
     ref_hgt = None
     ref_geotrans = None
+    ref_arr = None
 
     mask = None if maskfile is None else osgeo.gdal.Open(maskfile)
     dem = None if demfile is None else osgeo.gdal.Open(demfile)
@@ -1731,7 +1791,7 @@ def export_products(
         prev_maskfile = log_data['maskfilename'] if 'maskfilename' \
             in log_data.keys() else None
 
-        if maskfile != prev_maskfile:
+        if maskfile != prev_maskfile and prev_maskfile is not None:
             update_mode = 'full_extract'
             LOGGER.warning(
                 'Mask file has changed. Setting update mode to full_extract.')
@@ -1742,7 +1802,7 @@ def export_products(
         prev_demfile = log_data['demfile'] if 'demfile' \
             in log_data.keys() else None
 
-        if demfile != prev_demfile:
+        if demfile != prev_demfile and prev_demfile is not None:
             update_mode = 'full_extract'
             LOGGER.warning(
                 'DEM file has changed. Setting update mode to full_extract.')
@@ -1897,9 +1957,14 @@ def export_products(
                               bounds=bounds,
                               clip_json=prods_TOTbbox,
                               mask_file=mask,
+                              iono_filter=iono_filter,
+                              is_nisar_file=is_nisar_file,
                               verbose=verbose,
                               overwrite=True)
 
+        prog_bar = ARIAtools.util.misc.ProgressBar(
+            maxValue=len(product_dict[0]), prefix='Exporting ionosphere: '
+        )
         for i, layer in enumerate(product_dict[0]):
             outname = os.path.abspath(
                 os.path.join(
@@ -1923,6 +1988,9 @@ def export_products(
             # track valid files
             if os.path.exists(outname + '.vrt'):
                 prev_outname_check = copy.deepcopy(outname)
+                
+            prog_bar.update(i + 1)
+        prog_bar.close()
 
         # track consistency of dimensions
         if 'prev_outname_check' in locals():
@@ -1941,8 +2009,6 @@ def export_products(
     with open(full_product_dict_file, 'w') as ofp:
         json.dump(full_product_dict, ofp)
 
-    mp_args = []
-    extracted_files = []
     for ilayer, layer in enumerate(layers):
 
         product_dict = [[j[layer] for j in full_product_dict],
@@ -1953,9 +2019,8 @@ def export_products(
         if not os.path.exists(workdir):
             os.mkdir(workdir)
 
+        mp_args = []
         # Iterate through all IFGs
-        # TODO can we wrap this into funtion and run it
-        # with multiprocessing, to gain speed up
         for ii, product in enumerate(product_dict[0]):
             ifg_tag = product_dict[1][ii][0]
             outname = os.path.abspath(os.path.join(workdir, ifg_tag))
@@ -1972,74 +2037,112 @@ def export_products(
                 multilooking, verbose, is_nisar_file, range_correction,
                 rankedResampling, update_mode))
 
-    start_time = time.time()
-    if int(num_threads) == 1 or multiproc_method in ['single', 'threads']:
-        if multiproc_method == 'single':
-            outputs = []
-            for arg in tqdm.tqdm(mp_args, total=len(mp_args),
-                                 desc='Exporting'):
-                outputs.append(export_product_worker_helper(arg))
-                sys.stdout.flush()
-        else:
-            LOGGER.debug('Running %d total jobs with threads', len(mp_args))
+        if int(num_threads) == 1 or multiproc_method in ['single', 'threads']:
+            
+            # Initialize the custom ARIA progress bar
+            prog_bar = ARIAtools.util.misc.ProgressBar(
+                maxValue=len(mp_args), prefix=f'Exporting {layer}: '
+            )
 
-            # Create a progress bar
-            with tqdm.tqdm(total=len(mp_args), desc='Exporting') as pbar:
-                # Create jobs with a wrapper that includes progress update
+            if multiproc_method == 'single':
+                outputs = []
+                for i, arg in enumerate(mp_args):
+                    outputs.append(export_product_worker_helper(arg))
+                    prog_bar.update(i + 1)
+                    sys.stdout.flush()
+                prog_bar.close()
+                
+            else:
+                LOGGER.debug('Running %d total jobs with threads', len(mp_args))
+
+                # Set up a thread-safe counter for Dask
+                lock = threading.Lock()
+                completed = 0
+
+                def update_progress(result):
+                    nonlocal completed
+                    with lock:
+                        completed += 1
+                        prog_bar.update(completed)
+                    return result
+
+                # Create jobs wrapped with our thread-safe progress updater
                 jobs = []
                 for arg in mp_args:
-                    # Create a delayed job including work and progress update
-                    job = dask.delayed(lambda x: (export_product_worker(*x),
-                                                  pbar.update(1))[0])(arg)
+                    job = dask.delayed(
+                        lambda x: update_progress(export_product_worker(*x))
+                    )(arg)
                     jobs.append(job)
 
                 # Compute all jobs
-                outputs = dask.compute(jobs, num_workers=int(num_threads),
-                                       scheduler='threads')[0]
+                outputs = dask.compute(
+                    jobs, num_workers=int(num_threads), scheduler='threads'
+                )[0]
+                prog_bar.close()
 
-        for ii, ilayer, outname, prod_arr in outputs:
-            if ii == 0 and ilayer == 0:
-                ref_arr = copy.deepcopy(prod_arr)
-            else:
-                ARIAtools.util.vrt.dim_check(ref_arr, prod_arr)
-            prev_outname = outname
+            for ii_out, ilayer_out, outname, prod_arr in outputs:
+                if ref_arr is None:
+                    ref_arr = copy.deepcopy(prod_arr)
+                else:
+                    ARIAtools.util.vrt.dim_check(ref_arr, prod_arr)
+                prev_outname = outname
 
-    elif multiproc_method == 'gnu_parallel':
-        export_workers_temp_dir = os.path.join(outDir, 'export_workers')
-        if os.path.isdir(export_workers_temp_dir):
-            shutil.rmtree(export_workers_temp_dir)
-        os.mkdir(export_workers_temp_dir)
+        elif multiproc_method == 'gnu_parallel':
+            export_workers_temp_dir = os.path.join(outDir, 'export_workers')
+            if os.path.isdir(export_workers_temp_dir):
+                shutil.rmtree(export_workers_temp_dir)
+            os.mkdir(export_workers_temp_dir)
 
-        for ii, args in enumerate(mp_args):
-            this_json_file = os.path.join(
-                outDir, 'export_workers',
-                'export_product_args_%2.2d.json' % ii)
-            with open(this_json_file, 'w') as ofp:
-                json.dump(args, ofp)
+            for ii_arg, args in enumerate(mp_args):
+                this_json_file = os.path.join(
+                    outDir, 'export_workers',
+                    'export_product_args_%2.2d.json' % ii_arg)
+                with open(this_json_file, 'w') as ofp:
+                    json.dump(args, ofp)
 
-        LOGGER.debug('Running %d total jobs in parallel' % len(mp_args))
-        # Run the export worker jobs with GNU parallel
-        subprocess.call((
-            'find %s/export_workers -name "export_product_args_*.json" | '
-            'parallel -j %d export_product.py {}') % (
-                outDir, int(num_threads)), shell=True)
-        end_time = time.time()
+            LOGGER.debug('Running %d total jobs in parallel' % len(mp_args))
+            
+            prog_bar = ARIAtools.util.misc.ProgressBar(
+                maxValue=len(mp_args), prefix=f'Exporting {layer}: '
+            )
 
-        # load in output files and verify dimensions
-        output_files = glob.glob(os.path.join(
-            export_workers_temp_dir, 'outputs_*.json'))
+            # Run the export worker jobs with GNU parallel in the background
+            proc = subprocess.Popen((
+                'find %s/export_workers -name "export_product_args_*.json" | '
+                'parallel -j %d export_product.py {}') % (
+                    outDir, int(num_threads)), shell=True)
 
-        if len(output_files) > 0:
-            with open(os.path.join(
-                    export_workers_temp_dir, 'outputs_0_0.json')) as ifp:
-                output_dict = json.load(ifp)
-                ref_arr = copy.deepcopy(output_dict['prod_arr'])
+            # Poll the directory for completed JSON files to update progress
+            while proc.poll() is None:
+                num_done = len(glob.glob(
+                    os.path.join(export_workers_temp_dir, 'outputs_*.json')
+                ))
+                prog_bar.update(num_done)
+                time.sleep(1.0)
 
-            for output_file in output_files:
-                with open(output_file) as ifp:
-                    output_dict = json.load(ifp)
-                ARIAtools.util.vrt.dim_check(ref_arr, output_dict['prod_arr'])
-                prev_outname = output_dict['outname']
+            # Catch the final update immediately after the process finishes
+            num_done = len(glob.glob(
+                os.path.join(export_workers_temp_dir, 'outputs_*.json')
+            ))
+            prog_bar.update(num_done)
+            prog_bar.close()
+
+            # load in output files and verify dimensions
+            output_files = glob.glob(os.path.join(
+                export_workers_temp_dir, 'outputs_*.json'))
+
+            if len(output_files) > 0:
+                # Remove hardcoded 0_0 so it grabs the correct layer file
+                if ref_arr is None:
+                    with open(output_files[0]) as ifp:
+                        output_dict = json.load(ifp)
+                        ref_arr = copy.deepcopy(output_dict['prod_arr'])
+
+                for output_file in output_files:
+                    with open(output_file) as ifp:
+                        output_dict = json.load(ifp)
+                    ARIAtools.util.vrt.dim_check(ref_arr, output_dict['prod_arr'])
+                    prev_outname = output_dict['outname']
 
     end_time = time.time()
     LOGGER.debug(
@@ -2055,10 +2158,8 @@ def export_products(
     if os.path.exists(plots_subdir) and len(os.listdir(plots_subdir)) == 0:
         shutil.rmtree(plots_subdir)
 
-    try:
-        retval = ref_arr
-    except UnboundLocalError:
-        retval = [None, None, None, None]
+    retval = [None]*4 if ref_arr is None else ref_arr
+
     return retval
 
 

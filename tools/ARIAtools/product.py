@@ -496,10 +496,13 @@ class Product:
             version = basename.split('_')[-1][:-3]
             version = '.'.join(version)
             nc_version_check = [version]
-            if not basename.endswith('_N_F_J_001.h5'):
+
+            # check the algorithm CRID version seperate.
+            CRIDversion = basename.split('_')[-5][-4:]
+            if int(CRIDversion)<5006:
                 LOGGER.warning(
                     'input file %s is an older, unsupported '
-                    'version of the NISAR sample product', fname)
+                    'CRID version of the NISAR sample product', fname)
                 return []
 
         else:
@@ -881,10 +884,10 @@ class Product:
         # initiate variables
         rdrmetadata_dict = {}
         sdskeys = ['/science/LSAR/identification/boundingPolygon']
-        # Pass pair name
+        # Pass pair name (Forced to date2_date1 convention)
         basename = os.path.basename(fname)
-        self.pairname = basename.split('_')[11][:8] + '_'
-        self.pairname += basename.split('_')[13][:8]
+        self.pairname = basename.split('_')[13][:8] + '_'
+        self.pairname += basename.split('_')[11][:8]
 
         # Get polarization
         pol_dict = {}

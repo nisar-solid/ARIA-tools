@@ -43,6 +43,7 @@ LOGGER = logging.getLogger(__name__)
 
 def stitch_unwrapped_frames(input_unw_files: List[str],
                             input_conncomp_files: List[str],
+                            is_nisar_file: Optional[bool] = False,
                             proj: Optional[str] = 'EPSG:4326',
                             xres: Optional[float] = None,
                             yres: Optional[float] = None,
@@ -95,32 +96,55 @@ def stitch_unwrapped_frames(input_unw_files: List[str],
                 'PATH'].split('"')[1].split('/')[-1]
             LOGGER.info('Frame-2: ', frame2_prods)
 
+        # apply embedded artifact mask if NISAR GUNW
+        frame1_nisar_msk = None
+        frame2_nisar_msk = None
+        if is_nisar_file:
+            # Get paths to masks from each respective frame
+            # NOTE: Only load Frame 1 mask if it's the very first iteration.
+            # In subsequent iterations, Frame 1 is the
+            # already-masked `corr_unw`.
+            if i == 0:
+                frame1_nisar_msk = \
+                    ARIAtools.util.stitch.get_binary_nisar_mask_from_path(
+                    unw_attr_dicts[ix1]['PATH']
+                )
+            
+            frame2_nisar_msk = \
+                ARIAtools.util.stitch.get_binary_nisar_mask_from_path(
+                unw_attr_dicts[ix2]['PATH']
+            )
+
         # Get numpy masked arrays
         # Frame1
         frame1_unw_array = ARIAtools.util.stitch.get_GUNW_array(
             filename=unw_attr_dicts[ix1]['PATH'],
             proj=proj,
             xres=xres, yres=yres,
-            nodata=unw_attr_dicts[ix1]['NODATA'])
+            nodata=unw_attr_dicts[ix1]['NODATA'],
+            mask=frame1_nisar_msk)
 
         frame1_conn_array = ARIAtools.util.stitch.get_GUNW_array(
             filename=conncomp_attr_dicts[ix1]['PATH'],
             proj=proj,
             xres=xres, yres=yres,
-            nodata=conncomp_attr_dicts[ix1]['NODATA'])
+            nodata=conncomp_attr_dicts[ix1]['NODATA'],
+            mask=frame1_nisar_msk)
 
         # Frame2
         frame2_unw_array = ARIAtools.util.stitch.get_GUNW_array(
             filename=unw_attr_dicts[ix2]['PATH'],
             proj=proj,
             xres=xres, yres=yres,
-            nodata=unw_attr_dicts[ix2]['NODATA'])
+            nodata=unw_attr_dicts[ix2]['NODATA'],
+            mask=frame2_nisar_msk)
 
         frame2_conn_array = ARIAtools.util.stitch.get_GUNW_array(
             filename=conncomp_attr_dicts[ix2]['PATH'],
             proj=proj,
             xres=xres, yres=yres,
-            nodata=conncomp_attr_dicts[ix2]['NODATA'])
+            nodata=conncomp_attr_dicts[ix2]['NODATA'],
+            mask=frame2_nisar_msk)
 
         # capture all lyr nodata values
         conncomp_nodata_values = [
@@ -639,6 +663,7 @@ def product_stitch_sequential(input_unw_files: List[str],
                               output_unw: Optional[str] = './unwMerged',
                               output_conn: Optional[str] = './connCompMerged',
                               output_format: Optional[str] = 'ENVI',
+                              is_nisar_file: Optional[bool] = False,
                               bounds: Optional[tuple] = None,
                               clip_json: Optional[str] = None,
                               mask_file: Optional[str] = None,
@@ -674,6 +699,8 @@ def product_stitch_sequential(input_unw_files: List[str],
         Connected Components
     output_format : str
         output format used for gdal writer [e.g., Gtiff ENVI], default is ENVI
+    is_nisar_file : bool
+        is NISAR GUNW or now [True/False], default is False (assumes S1 GUNW)
     bounds : tuple
         (West, South, East, North) bounds obtained in ariaExtract.py
     clip_json : str
@@ -717,17 +744,38 @@ def product_stitch_sequential(input_unw_files: List[str],
         osgeo.gdal.BuildVRT(
             str(temp_unw_out.with_suffix('.vrt')), input_unw_files)
         osgeo.gdal.BuildVRT(
-            str(temp_conn_out.with_suffix('.vrt')), input_conncomp_files)
+                str(temp_conn_out.with_suffix('.vrt')), input_conncomp_files)
+        if is_nisar_file:
+            # Get path to mask in the GUNW
+            nisar_binary_mask = \
+                ARIAtools.util.stitch.get_binary_nisar_mask_from_path(
+                input_unw_files[0]
+            )
+
+            # apply it and save as temporary GeoTIFFs
+            ARIAtools.util.stitch.apply_mask_and_write(
+                vrt_unw_path=str(temp_unw_out.with_suffix('.vrt')),
+                vrt_conn_path=str(temp_conn_out.with_suffix('.vrt')),
+                binary_mask=nisar_binary_mask,
+                out_unw_path=temp_unw_out,
+                out_conn_path=temp_conn_out,
+                multiply_unw_by=-1
+            )
 
     else:
         (combined_unwrap, combined_conn, combined_snwe) = \
             stitch_unwrapped_frames(
                 input_unw_files, input_conncomp_files,
+                is_nisar_file=is_nisar_file,
                 proj=epsg,
                 xres=arrres[0], yres=arrres[1],
                 correction_method=correction_method,
                 range_correction=range_correction, direction_N_S=True,
                 verbose=verbose)
+
+        # Invert phase to match date2_date1 convention
+        if is_nisar_file:
+            combined_unwrap = combined_unwrap * -1
 
         # Write
         # write stitched unwrappedPhase
@@ -776,7 +824,7 @@ def product_stitch_sequential(input_unw_files: List[str],
             str(output.with_suffix('.vrt')), str(output), format="VRT")
 
         # Remove temp files
-        for suffix in [None, '.vrt', '.xml', '.hdr', '.aux.xml']:
+        for suffix in [None, '.vrt', '.xml', '.hdr', '.aux.xml', '.tif']:
             target = (input if suffix is None else
                       input.with_suffix(suffix))
             if target.exists():

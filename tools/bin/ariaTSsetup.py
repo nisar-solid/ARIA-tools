@@ -51,7 +51,8 @@ LOGGER = logging.getLogger('ariaTSsetup.py')
 def create_parser():
     """Parser to read command line arguments."""
     parser = argparse.ArgumentParser(
-        description='Prepare ARIA products for time series processing.')
+        description='Prepare standard GUNW products products for '
+                    'time series processing.')
     parser.add_argument(
         '-f', '--file', dest='imgfile', type=str, required=True,
         help='ARIA file')
@@ -132,6 +133,13 @@ def create_parser():
              'bounding box. Default 0.0081 = 0.0081km\u00b2 = area of single'
              'pixel at standard 90m resolution')
     parser.add_argument(
+        '-if', '--iono_filter', action='store_true', dest='iono_filter',
+        help='Enable spatial filtering and quadratic surface approximation '
+             'of the NISAR ionosphere layer. Caution: This may smooth out '
+             'valid short-wavelength signals. (Note: This filter is always '
+             'enforced for S1 GUNWs to mitigate large, unreliable artifacts).'
+    )
+    parser.add_argument(
         '--version', dest='version', default=None,
         help='Specify version as str, e.g. 2_0_4 or all prods; default: all')
     parser.add_argument(
@@ -142,7 +150,7 @@ def create_parser():
         '-verbose', '--verbose', action='store_true', dest='verbose',
         help="Toggle verbose mode on.")
     parser.add_argument(
-        '--log-level', default='warning', help='Logger log level')
+        '--log-level', default='info', help='Logger log level')
     return parser
 
 
@@ -301,7 +309,7 @@ def generate_stack(aria_prod, stack_layer, output_file_name,
 
     # Progress bar
     prog_bar = ARIAtools.util.misc.ProgressBar(
-        maxValue=len(int_list), print_msg='Creating stack: ')
+        maxValue=len(int_list), prefix=f'Exporting {output_file_name}: ')
 
     # only perform following checks if a differential layer
     # all NISAR layers are differential
@@ -367,8 +375,10 @@ def generate_stack(aria_prod, stack_layer, output_file_name,
     range_spacing = aria_prod.products[0][0]['slantRangeSpacing'][0]
     if is_nisar_file:
         orbit_direction = str.split(os.path.basename(aria_prod.files[0]), '_')[6]
+        platform = 'NISAR'
     else:
         orbit_direction = str.split(os.path.basename(aria_prod.files[0]), '-')[2]
+        platform = 'Sen'
 
     with open(os.path.join(stack_dir, output_file_name + '.vrt'), 'w') as fid:
         fid.write('''<VRTDataset rasterXSize="{xsize}" rasterYSize="{ysize}">
@@ -421,7 +431,8 @@ def generate_stack(aria_prod, stack_layer, output_file_name,
             <MDI key="startRange">{start_range}</MDI>
             <MDI key="endRange">{end_range}</MDI>
             <MDI key="slantRangeSpacing">{range_spacing}</MDI>
-            <MDI key="orbitDirection">{orbDir}</MDI>'''
+            <MDI key="orbitDirection">{orbDir}</MDI>
+            <MDI key="PLATFORM">{platform}</MDI>'''
             fid.write(outstr)
             if b_perp != []:
                 bPerp = b_perp[dates]
@@ -582,6 +593,7 @@ def main():
         'prods_TOTbbox': prods_TOTbbox,
         'demfile': demfile,
         'demfile_expanded': demfile_expanded,
+        'iono_filter':  args.iono_filter,
         'is_nisar_file': is_nisar_file,
         'arrres': arrres,
         'lat': lat,
