@@ -40,7 +40,12 @@ def createParser():
                     'products.')
     parser.add_argument(
         '-f', '--file', dest='imgfile', type=str, required=True,
-        help='ARIA file')
+        help='List of Sentinel-1 GUNW or NISAR GUNW products '
+             '(wildcards supported) or txt file with product urls '
+             'for virtual access without downloading. For virtual '
+             'processing a local metadata cache is created on '
+             'first run; subsequent runs read from the cache for '
+             'faster initialization.')
     parser.add_argument(
         '-w', '--workdir', dest='workdir', default='./',
         help='Specify directory to deposit all outputs. Default is local '
@@ -126,7 +131,11 @@ def createParser():
         '-v', '--verbose', action='store_true', dest='verbose',
         help="Toggle verbose mode on.")
     parser.add_argument(
-        '--log-level', default='info', help='Logger log level')
+        '--log-level', 
+        choices=['debug', 'info', 'warning', 'error'], 
+        default='info', 
+        help='Logger log level. Default: info.'
+    )
     return parser
 
 
@@ -138,6 +147,7 @@ def main(inps=None):
         'debug': logging.DEBUG, 'info': logging.INFO,
         'warning': logging.WARNING, 'error': logging.ERROR}[args.log_level]
     logging.basicConfig(level=log_level, format=ARIAtools.util.log.FORMAT)
+    LOGGER.info('ARIAtools version: %s' % ARIAtools.__version__)
     print('*****************************************************************')
     print('*** Plotting Function ***')
     print('*****************************************************************')

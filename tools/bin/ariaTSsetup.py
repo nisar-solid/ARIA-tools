@@ -15,6 +15,7 @@ baseline, LOS file(s), and (where available) tropospheric correction layers.
 """
 import os
 import sys
+import h5py
 import glob
 import copy
 import logging
@@ -35,6 +36,7 @@ import ARIAtools.util.log
 import ARIAtools.util.mask
 import ARIAtools.util.misc
 import ARIAtools.util.vrt
+import ARIAtools.util.s3
 import ARIAtools.constants
 import ARIAtools.util.runlog
 
@@ -56,7 +58,12 @@ def create_parser():
                     'time series processing.')
     parser.add_argument(
         '-f', '--file', dest='imgfile', type=str, required=True,
-        help='ARIA file')
+        help='List of Sentinel-1 GUNW or NISAR GUNW products '
+             '(wildcards supported) or txt file with product urls '
+             'for virtual access without downloading. For virtual '
+             'processing a local metadata cache is created on '
+             'first run; subsequent runs read from the cache for '
+             'faster initialization.')
     parser.add_argument(
         '-w', '--workdir', dest='workdir', default='./',
         help='Specify directory to deposit all outputs. Default is local '
@@ -151,7 +158,11 @@ def create_parser():
         '-verbose', '--verbose', action='store_true', dest='verbose',
         help="Toggle verbose mode on.")
     parser.add_argument(
-        '--log-level', default='info', help='Logger log level')
+        '--log-level', 
+        choices=['debug', 'info', 'warning', 'error'], 
+        default='info', 
+        help='Logger log level. Default: info.'
+    )
     return parser
 
 
@@ -468,7 +479,9 @@ def main():
         args.num_threads = 'ALL_CPUS'
 
     LOGGER.info('ARIAtools version: %s' % ARIAtools.__version__)
-    LOGGER.info('Time-series Preparation Function')
+    print('*****************************************************************')
+    LOGGER.info('*** Time-series Preparation Function ***')
+    print('*****************************************************************')
     LOGGER.info(
         'Thread count specified for gdal multiprocessing = %s' % (
             args.num_threads))
@@ -546,7 +559,7 @@ def main():
     }
 
     # Pass DEM-filename, loaded DEM array, and lat/lon arrays
-    LOGGER.info('Download/cropping DEM')
+    LOGGER.debug('Download/cropping DEM')
     demfile, demfile_expanded, lat, lon = \
         ARIAtools.util.dem.prep_dem(**dem_dict)
 
@@ -582,7 +595,7 @@ def main():
             'rankedResampling': args.rankedResampling,
             'runlog': runlog
         }
-        LOGGER.info('Download/cropping mask')
+        LOGGER.debug('Download/cropping mask')
         maskfilename = ARIAtools.util.mask.prep_mask(**mask_dict)
     else:
         maskfilename = None
@@ -612,8 +625,8 @@ def main():
     LOGGER.info('Extracting %s for each interferogram pair' % layers)
     ref_arr_record = ARIAtools.extractProduct.export_products(
         standardproduct_info.products[1], tropo_total=False, layers=layers,
-        rankedResampling=args.rankedResampling, multiproc_method='threads',
-        **export_dict, runlog=runlog)
+        rankedResampling=args.rankedResampling,
+        multiproc_method='gnu_parallel', **export_dict, runlog=runlog)
 
     # Remove pairing and pass combined dictionary of all layers
     extract_dict = collections.defaultdict(list)
@@ -686,6 +699,10 @@ def main():
 
         # Track consistency of dimensions
         ARIAtools.util.vrt.dim_check(ref_arr_record, prod_arr_record)
+
+    # Fix VRT files: replace /vsis3/ paths with /vsicurl/ for
+    # downstream tool compatibility (e.g. MintPy).
+    ARIAtools.util.s3.fixup_vrt_s3_paths(args.workdir)
 
     # Generate UNW stack
     ref_dlist = generate_stack(
